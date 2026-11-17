@@ -209,16 +209,23 @@ ladder** targets delivery instead:
    defers (a complete no-op — no lock, no ledger, no schedule advance).
 2. **Origin gone, lone session** — the single remaining session delivers the
    full turn (one session is never the confusing case).
-3. **Origin gone, several sessions open** — one owner is elected
-   deterministically (smallest live session id) and receives a **notify**
-   (`schedule action=run_now id=…`) instead of a surprise turn; the rest
-   defer. Shell jobs still run their command once (under the lock) but the
-   optional wake is downgraded to the same notify.
+3. **Origin gone, several sessions open** — the job **waits**: nothing about
+   it reaches any session and its due run is kept, so it is delivered once
+   rung 1 or 2 applies (its session resumed, or a lone session left), with
+   its own `missedWindow` deciding how many runs it owes. One session,
+   elected deterministically (smallest live session id), records the wait
+   once (`waitingSince`, one `waiting (origin absent)` run-log row). Shell
+   jobs still run their command once (under the lock) in that session,
+   silently; a turn their result asks for is held (`pendingWake`) and
+   delivered by the first session that may deliver the job. `schedule
+   action=list` shows the waiting line.
 
 Liveness comes from per-session heartbeat files under
 `~/.pi-schedule/presence/` (fresh within 3 ticks **and** pid-alive), refreshed
 every tick and removed on shutdown. `run_now` is an explicit act in the
-current session and always delivers a full turn there, ignoring the ladder.
+current session and always delivers a full turn there, ignoring the ladder;
+on a job whose session is gone it also takes the job over (the current
+session becomes its origin and its wait ends, delivering any held turn).
 Jobs created before this feature (no `originSessionId`) are treated as
 origin-absent, so they immediately stop hijacking arbitrary sessions.
 On a pi build that does not expose a session id, delivery degrades to the

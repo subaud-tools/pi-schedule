@@ -146,10 +146,23 @@ export interface ScheduledJob {
   projectPath?: string;
   /**
    * Session id that created the job. When that session is alive at fire time
-   * it receives the full agent turn; otherwise delivery falls back to an
-   * elected owner (notify). Undefined for legacy rows / non-session creators.
+   * it receives the full agent turn; otherwise, with several sessions open,
+   * the job waits for it (see delivery.ts). Undefined for legacy rows /
+   * non-session creators.
    */
   originSessionId?: string;
+  /**
+   * ISO timestamp from which the job has been waiting for its origin session
+   * (origin gone, several sessions open). Set once per wait by the elected
+   * session; cleared when a delivering session records an attempt.
+   */
+  waitingSince?: string;
+  /**
+   * Shell only: a run's result asked for an agent turn while the job was
+   * waiting; the turn is held until a session that may deliver the job
+   * delivers it from `lastShell`. A later run replaces it.
+   */
+  pendingWake?: boolean;
   enabled: boolean;
   /** Overdue handling. Default catch_up_one. */
   missedWindow: MissedWindowPolicy;

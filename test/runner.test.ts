@@ -205,6 +205,10 @@ function makeHarness(opts: HarnessOpts = {}) {
         JSON.stringify({ sessionId, pid: process.pid, cwd, lastSeen: Date.now() }),
       );
     },
+    /** Simulate a session closing by deleting its heartbeat record. */
+    removePresence: (sessionId: string) => {
+      rmSync(join(paths.presenceDir, `${sessionId}.json`), { force: true });
+    },
     setClock: (d: Date) => {
       clock = d;
     },
@@ -1305,8 +1309,8 @@ describe("ScheduleRunner — origin-first delivery ladder", () => {
     expect(after.nextRunAt).toBe(T0); // still due
   });
 
-  it("downgrades to a notify (no turn) in the elected owner when origin is gone and several sessions are open", async () => {
-    // self "B" is the lexicographically-smallest live id → the owner.
+  it("waits in the elected session when origin is gone and several are open: nothing sent, still due, one row", async () => {
+    // self "B" is the lexicographically-smallest live id → the elected session.
     const h = makeHarness({ sessionId: "B" });
     h.trust.trust(h.project);
     const job = h.createProject("mine");
@@ -1317,19 +1321,144 @@ describe("ScheduleRunner — origin-first delivery ladder", () => {
 
     await h.runner.fireDue(h.ctx, { source: "session_start" });
 
-    expect(h.sent).toHaveLength(0); // NO surprise agent turn
-    expect(h.customMessages).toHaveLength(1); // a notify instead
-    expect(h.customMessages[0]?.content).toContain("run_now");
-    expect(h.customMessages[0]?.triggerTurn).toBe(false);
+    expect(h.sent).toHaveLength(0); // no surprise agent turn
+    expect(h.customMessages).toHaveLength(0); // no line in this session
+    expect(h.notifies).toHaveLength(0);
     const after = h.store.get(job.id, h.project)!;
-    expect(after.lastStatus).toBe("ok"); // delivered (as notify) + advanced
-    expect(new Date(after.nextRunAt).getTime()).toBeGreaterThan(
-      new Date(T0).getTime(),
-    );
+    expect(after.lastStatus).toBeNull(); // untouched
+    expect(after.runCount).toBe(0);
+    expect(after.nextRunAt).toBe(T0); // still due
+    expect(after.waitingSince).toBe(T0);
+    const rows = h.ledger.history({});
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("skipped");
+    expect(rows[0]?.detail).toBe("waiting (origin absent)");
   });
 
-  it("defers (no-op) in a non-owner session when origin is gone and several are open", async () => {
-    const h = makeHarness({ sessionId: "D" }); // not the smallest → not owner
+  it("a waiting notify job sends nothing either", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.store.create({
+      name: "remind",
+      prompt: "stretch",
+      action: "notify",
+      schedule: parseSchedule("every 1h"),
+      scope: "project",
+      projectPath: h.project,
+    });
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    expect(h.sent).toHaveLength(0);
+    expect(h.customMessages).toHaveLength(0);
+    expect(h.notifies).toHaveLength(0);
+    expect(h.store.get(job.id, h.project)!.nextRunAt).toBe(T0);
+  });
+
+  it("repeated ticks while waiting write exactly one waiting row", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.createProject("mine");
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    for (let i = 1; i <= 3; i++) {
+      h.setClock(new Date(new Date(T0).getTime() + i * 60_000));
+      await h.runner.fireDue(h.ctx, { source: "tick" });
+    }
+
+    const rows = h.ledger.history({}).filter((r) => r.detail === "waiting (origin absent)");
+    expect(rows).toHaveLength(1);
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBe(T0);
+  });
+
+  it("a waiting job is delivered once when it may be (lone session), clearing waitingSince", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.createProject("mine");
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.sent).toHaveLength(0);
+
+    h.removePresence("C"); // B is now the lone session
+    h.setClock(new Date(new Date(T0).getTime() + 3 * 3_600_000)); // 3 slots missed
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    expect(h.sent).toHaveLength(1); // catch_up_one: one delivery, not three
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.lastStatus).toBe("ok");
+    expect(after.runCount).toBe(1);
+    expect(after.waitingSince).toBeUndefined();
+  });
+
+  it("a waiting job is delivered when its own session evaluates it", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.createProject("mine");
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    h.setOrigin(job.id, "B"); // its own session is the one evaluating now
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBeUndefined();
+  });
+
+  it("a waiting job with missedWindow=skip is skipped, not delivered, when it may run again", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.createProject("mine");
+    h.store.upsert({ ...h.store.get(job.id, h.project)!, missedWindow: "skip" });
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    h.removePresence("C");
+    h.setClock(new Date(new Date(T0).getTime() + 3 * 3_600_000));
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    expect(h.sent).toHaveLength(0);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.lastStatus).toBe("skipped");
+    expect(after.waitingSince).toBeUndefined();
+  });
+
+  it("a waiting one-shot job is not terminated", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.store.create({
+      name: "once",
+      prompt: "do it once",
+      schedule: parseSchedule("in 10m"),
+      scope: "project",
+      projectPath: h.project,
+    });
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.enabled).toBe(true);
+    expect(after.terminated).toBeNull();
+    expect(after.runCount).toBe(0);
+  });
+
+  it("a non-elected session leaves a waiting job alone (no row, no waitingSince)", async () => {
+    const h = makeHarness({ sessionId: "D" }); // not the smallest → not elected
     h.trust.trust(h.project);
     const job = h.createProject("mine");
     h.setOrigin(job.id, "A");
@@ -1341,7 +1470,10 @@ describe("ScheduleRunner — origin-first delivery ladder", () => {
 
     expect(h.sent).toHaveLength(0);
     expect(h.customMessages).toHaveLength(0);
-    expect(h.store.get(job.id, h.project)!.lastStatus).toBeNull();
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.lastStatus).toBeNull();
+    expect(after.waitingSince).toBeUndefined();
+    expect(h.ledger.history({})).toHaveLength(0);
   });
 
   it("delivers a full turn in a lone session even when it is not the origin", async () => {
@@ -1368,5 +1500,178 @@ describe("ScheduleRunner — origin-first delivery ladder", () => {
     await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
 
     expect(h.sent).toHaveLength(1); // explicit user act here → full turn
+    expect(h.store.get(job.id, h.project)!.originSessionId).toBe("A"); // home unchanged
+  });
+
+  it("run_now on a job whose session is gone takes it over: this session becomes its home", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.createProject("mine");
+    h.setOrigin(job.id, "A"); // gone
+    h.addPresence("C");
+    h.forceDue(job.id);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBe(T0);
+
+    await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
+
+    expect(h.sent).toHaveLength(1);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.originSessionId).toBe("B");
+    expect(after.waitingSince).toBeUndefined();
+
+    // From then on it is delivered here as its home, not left waiting.
+    h.forceDue(job.id, new Date(new Date(T0).getTime() + 3_600_000).toISOString());
+    h.setClock(new Date(new Date(T0).getTime() + 3_600_000));
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+    expect(h.sent).toHaveLength(2);
+  });
+});
+
+describe("ScheduleRunner — waiting shell jobs run silently and hold their turn", () => {
+  /** Session "B" is elected; origin "A" is gone; "C" is another open session. */
+  function waitingShell(opts: HarnessOpts, wakeOn: "failure" | "never" = "failure") {
+    // Same object, so a test can change execResult between runs.
+    const h = makeHarness(Object.assign(opts, { sessionId: "B" }));
+    h.trust.trust(h.project);
+    const job = h.store.create({
+      name: "upstream-check",
+      prompt: "Inspect the upstream failure.",
+      action: "shell",
+      command: "check-upstream",
+      wakeOn,
+      tier: "mutate",
+      schedule: parseSchedule("every 1h"),
+      scope: "project",
+      projectPath: h.project,
+    });
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+    return { h, job };
+  }
+
+  it("runs the command once, shows nothing in the session, stores lastShell and advances", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 0, stdout: "fine\n" } }, "never");
+
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    expect(h.execCalls).toHaveLength(1);
+    expect(h.notifies).toHaveLength(0); // no "running shell" line
+    expect(h.customMessages).toHaveLength(0); // no "Shell … exit" message
+    expect(h.sent).toHaveLength(0);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.lastShell?.code).toBe(0);
+    expect(new Date(after.nextRunAt).getTime()).toBeGreaterThan(new Date(T0).getTime());
+    expect(after.pendingWake).toBeUndefined();
+  });
+
+  it("resuming its session clears the waiting marker even when nothing is held or due", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 0, stdout: "fine\n" } }, "never");
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBe(T0);
+
+    h.setOrigin(job.id, "B"); // its own session is back and evaluating
+    h.setClock(new Date(new Date(T0).getTime() + 60_000)); // not due again yet
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.waitingSince).toBeUndefined(); // list no longer says waiting
+    expect(h.execCalls).toHaveLength(1); // command not re-run
+    expect(h.sent).toHaveLength(0);
+  });
+
+  it("never sets the waiting marker without its run-log row when the lock is briefly taken", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 0, stdout: "fine\n" } }, "never");
+    // recordWaiting's lock attempt loses to another holder; later attempts succeed.
+    const spy = vi.spyOn(JobLockManager.prototype, "tryAcquire").mockImplementationOnce(() => null);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    spy.mockRestore();
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    const rows = h.ledger.history({}).filter((r) => r.detail === "waiting (origin absent)");
+    expect(rows).toHaveLength(1);
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBeDefined();
+  });
+
+  it("a failing run with wakeOn=failure holds the turn instead of sending it", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 2, stderr: "boom" } });
+
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    expect(h.sent).toHaveLength(0);
+    expect(h.notifies).toHaveLength(0);
+    expect(h.customMessages).toHaveLength(0);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.pendingWake).toBe(true);
+    expect(after.waitingSince).toBe(T0); // list shows it waiting
+  });
+
+  it("the origin session's next tick delivers the held turn once and clears it", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 2, stderr: "boom" } });
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    h.setOrigin(job.id, "B"); // its own session is the one evaluating now
+    h.setClock(new Date(new Date(T0).getTime() + 60_000)); // not due again yet
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    expect(h.execCalls).toHaveLength(1); // command not re-run
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.content).toContain("shellStatus: failure");
+    expect(h.sent[0]?.content).toContain("Inspect the upstream failure");
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.pendingWake).toBeUndefined();
+    expect(after.waitingSince).toBeUndefined();
+    expect(
+      h.ledger.history({}).some((r) => r.status === "delivered" && r.detail === "held shell turn"),
+    ).toBe(true);
+  });
+
+  it("a successful later run replaces a held turn", async () => {
+    const o: HarnessOpts = { execResult: { code: 2, stderr: "boom" } };
+    const { h, job } = waitingShell(o);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.pendingWake).toBe(true);
+
+    o.execResult = { code: 0, stdout: "fine\n" };
+    const later = new Date(new Date(T0).getTime() + 3_600_000);
+    h.setClock(later);
+    h.forceDue(job.id, later.toISOString());
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    expect(h.execCalls).toHaveLength(2);
+    expect(h.sent).toHaveLength(0);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.pendingWake).toBeUndefined();
+    expect(after.lastShell?.code).toBe(0);
+  });
+
+  it("run_now taking over a waiting shell job delivers its held turn when the new run does not wake", async () => {
+    const o: HarnessOpts = { execResult: { code: 2, stderr: "boom" } };
+    const { h, job } = waitingShell(o);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.pendingWake).toBe(true);
+
+    o.execResult = { code: 0, stdout: "fine\n" }; // passes now; wakeOn=failure
+    await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
+
+    expect(h.execCalls).toHaveLength(2);
+    expect(h.sent).toHaveLength(1); // the held failure turn
+    expect(h.sent[0]?.content).toContain("shellStatus: failure");
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.originSessionId).toBe("B");
+    expect(after.pendingWake).toBeUndefined();
+    expect(after.waitingSince).toBeUndefined();
+  });
+
+  it("run_now taking over a waiting shell job sends one turn when the new run wakes itself", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 2, stderr: "boom" } });
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
+
+    expect(h.sent).toHaveLength(1); // the new run's turn replaces the held one
+    expect(h.store.get(job.id, h.project)!.pendingWake).toBeUndefined();
   });
 });

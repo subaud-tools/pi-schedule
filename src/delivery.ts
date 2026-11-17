@@ -13,14 +13,18 @@
  *                             every other session defers.
  *  2. Origin gone, lone session → full turn (a single session is never the
  *                             confusing case, so it keeps today's behavior).
- *  3. Origin gone, many sessions → deterministically elect one owner (the
- *                             lexicographically smallest live id) which emits
- *                             a NOTIFY (no surprise turn); the rest defer.
+ *  3. Origin gone, many sessions → every session WAITS: nothing about the job
+ *                             reaches any session and its due run is kept
+ *                             until rung 1 or 2 applies (or run_now takes it
+ *                             over). The runner uses {@link electedSession}
+ *                             only to pick the one session that records the
+ *                             wait (and runs a shell job's command silently).
  *
  * Determinism matters: because every session sorts the same live set, they
- * all agree on the owner, so at most one session acts even before the lock.
+ * all agree on the elected session, so at most one session acts even before
+ * the lock.
  */
-export type DeliveryRole = "turn" | "notify" | "defer";
+export type DeliveryRole = "turn" | "wait" | "defer";
 
 export interface DeliveryDecisionInput {
   /** The evaluating session's own id. */
@@ -31,12 +35,16 @@ export interface DeliveryDecisionInput {
   aliveSessionIds: string[];
 }
 
-export function decideDelivery(input: DeliveryDecisionInput): DeliveryRole {
-  const { selfSessionId, originSessionId } = input;
-
+function aliveSet(input: { selfSessionId: string; aliveSessionIds: string[] }): Set<string> {
   // Self is always alive — presence may not have recorded it yet.
   const alive = new Set(input.aliveSessionIds);
-  alive.add(selfSessionId);
+  alive.add(input.selfSessionId);
+  return alive;
+}
+
+export function decideDelivery(input: DeliveryDecisionInput): DeliveryRole {
+  const { selfSessionId, originSessionId } = input;
+  const alive = aliveSet(input);
 
   const originAlive = Boolean(originSessionId) && alive.has(originSessionId as string);
   if (originAlive) {
@@ -48,6 +56,16 @@ export function decideDelivery(input: DeliveryDecisionInput): DeliveryRole {
     return "turn"; // lone session — not confusing, keep the full turn
   }
 
-  const owner = [...alive].sort()[0];
-  return selfSessionId === owner ? "notify" : "defer";
+  return "wait";
+}
+
+/**
+ * The one live session (lexicographically smallest id, self included) that
+ * does the bookkeeping for a waiting job. Every session computes the same one.
+ */
+export function electedSession(input: {
+  selfSessionId: string;
+  aliveSessionIds: string[];
+}): string {
+  return [...aliveSet(input)].sort()[0] as string;
 }
