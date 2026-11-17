@@ -761,83 +761,114 @@ export class ScheduleRunner {
     try {
       const fresh = this.opts.store.get(job.id, this.cwd) ?? job;
       if (!fresh.pendingWake) return null;
-      const at = this.now();
-      const runId = newRunId();
-      // Its own key: a held turn must never mark the job's next slot delivered.
-      const key = `${fresh.id}:held:${runId}`;
-      const tier = fresh.tier ?? DEFAULT_TIER;
-      const missedWindow = fresh.missedWindow ?? DEFAULT_MISSED_WINDOW;
-      const action: JobAction = fresh.action ?? DEFAULT_JOB_ACTION;
       const cleared: ScheduledJob = {
         ...fresh,
         pendingWake: undefined,
         waitingSince: undefined,
-        updatedAt: at.toISOString(),
+        updatedAt: this.now().toISOString(),
       };
-      const row = {
-        runId,
-        jobId: fresh.id,
-        jobName: fresh.name,
-        scope: fresh.scope,
-        projectPath: fresh.projectPath,
-        idempotencyKey: key,
-        source: opts.source,
-        startedAt: at.toISOString(),
-        tier,
-        missedWindow,
-        action,
-      };
-      const instruction = fresh.lastShell
-        ? selectShellFollowUp(fresh, fresh.lastShell)
-        : undefined;
-      if (!fresh.lastShell || !instruction) {
-        this.opts.store.upsert(cleared);
-        return cleared;
-      }
-      try {
-        const body = buildShellFollowUpPrompt({
-          job: fresh,
-          runId,
-          source: opts.source,
-          forced: opts.forced,
-          result: fresh.lastShell,
-          instruction,
-        });
-        await this.sendAgentMessage(body, ctx, opts.deliverAs);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.opts.store.upsert(cleared);
-        this.recordBestEffort({
-          ...row,
-          status: "error",
-          endedAt: this.now().toISOString(),
-          detail: `held shell turn: ${message}`,
-        });
-        return cleared;
-      }
-      this.privilege.register(runId, tier, {
-        jobId: fresh.id,
-        jobName: fresh.name,
-        scope: fresh.scope,
-        projectPath: fresh.projectPath,
-        idempotencyKey: key,
-        source: opts.source,
-        tier,
-        missedWindow,
-        action,
-        firedAt: this.now().toISOString(),
-      });
       this.opts.store.upsert(cleared);
-      this.recordBestEffort({
-        ...row,
-        status: "delivered",
-        endedAt: this.now().toISOString(),
-        detail: "held shell turn",
-      });
+      if (fresh.lastShell) {
+        await this.sendHeldTurn(ctx, fresh, fresh.lastShell, opts);
+      }
       return cleared;
     } finally {
       handle.release();
     }
+  }
+
+  /**
+   * Send the follow-up turn a held shell result asked for (best-effort: a
+   * failed send is recorded in the run log, never thrown). Caller holds the
+   * job's lock and owns pendingWake.
+   */
+  private async sendHeldTurn(
+    ctx: ExtensionContext,
+    job: ScheduledJob,
+    lastShell: ShellRunResult,
+    opts: { source: FireSource; forced: boolean; deliverAs?: "followUp" | "steer" },
+  ): Promise<void> {
+    const instruction = selectShellFollowUp(job, lastShell);
+    if (!instruction) return;
+    const runId = newRunId();
+    // Its own key: a held turn must never mark the job's next slot delivered.
+    const key = `${job.id}:held:${runId}`;
+    const tier = job.tier ?? DEFAULT_TIER;
+    const missedWindow = job.missedWindow ?? DEFAULT_MISSED_WINDOW;
+    const action: JobAction = job.action ?? DEFAULT_JOB_ACTION;
+    const startedAt = this.now().toISOString();
+    const row = {
+      runId,
+      jobId: job.id,
+      jobName: job.name,
+      scope: job.scope,
+      projectPath: job.projectPath,
+      idempotencyKey: key,
+      source: opts.source,
+      startedAt,
+      tier,
+      missedWindow,
+      action,
+    };
+    try {
+      const body = buildShellFollowUpPrompt({
+        job,
+        runId,
+        source: opts.source,
+        forced: opts.forced,
+        result: lastShell,
+        instruction,
+      });
+      await this.sendAgentMessage(body, ctx, opts.deliverAs);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.recordBestEffort({
+        ...row,
+        status: "error",
+        endedAt: this.now().toISOString(),
+        detail: `held shell turn: ${message}`,
+      });
+      return;
+    }
+    this.privilege.register(runId, tier, {
+      jobId: job.id,
+      jobName: job.name,
+      scope: job.scope,
+      projectPath: job.projectPath,
+      idempotencyKey: key,
+      source: opts.source,
+      tier,
+      missedWindow,
+      action,
+      firedAt: startedAt,
+    });
+    this.recordBestEffort({
+      ...row,
+      status: "delivered",
+      endedAt: this.now().toISOString(),
+      detail: "held shell turn",
+    });
+  }
+
+  /**
+   * run_now on a job whose origin session is gone: the calling session takes
+   * it over (becomes its origin; its wait ends). Returns the re-homed job, or
+   * null when its origin is alive (home unchanged) or the session id is unknown.
+   */
+  private takeOver(ctx: ExtensionContext, job: ScheduledJob): ScheduledJob | null {
+    const selfId = sessionIdOf(ctx) ?? this.selfSessionId;
+    if (!selfId || job.originSessionId === selfId) return null;
+    if (job.originSessionId && this.aliveFor(ctx, job).includes(job.originSessionId)) {
+      return null;
+    }
+    const rehomed: ScheduledJob = {
+      ...job,
+      originSessionId: selfId,
+      waitingSince: undefined,
+      updatedAt: this.now().toISOString(),
+    };
+    this.opts.store.upsert(rehomed);
+    return rehomed;
   }
 
   private async processOne(
@@ -961,7 +992,12 @@ export class ScheduleRunner {
 
     try {
       // Re-check after lock (check-then-act fix).
-      const fresh = this.opts.store.get(job.id, this.cwd) ?? job;
+      let fresh = this.opts.store.get(job.id, this.cwd) ?? job;
+      // run_now on a job whose session is gone: this session takes it over,
+      // and a turn its shell run held is delivered with this run (below).
+      const rehomed = opts.forced ? this.takeOver(ctx, fresh) : null;
+      const heldShell = rehomed?.pendingWake ? rehomed.lastShell : undefined;
+      if (rehomed) fresh = rehomed;
       const freshKey = opts.forced ? key : idempotencyKeyFor(fresh);
       const freshAction: JobAction = fresh.action ?? DEFAULT_JOB_ACTION;
       if (!opts.forced && this.alreadyDelivered(fresh, freshKey)) {
@@ -1023,6 +1059,15 @@ export class ScheduleRunner {
         pendingWake: delivery.pendingWake,
         waitingSince,
       });
+      // The held turn, unless this run's own result started a turn (a later
+      // run replaces a held turn).
+      if (heldShell && !delivery.wokeAgent) {
+        await this.sendHeldTurn(ctx, fresh, heldShell, {
+          source: opts.source,
+          forced: opts.forced,
+          deliverAs: "followUp",
+        });
+      }
       const term = terminalReason(updated, updated.runCount);
       const finalJob = term
         ? this.opts.store.terminate(updated, term, at)

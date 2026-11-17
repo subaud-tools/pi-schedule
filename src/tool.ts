@@ -152,7 +152,25 @@ function summarize(job: ScheduledJob, now: Date = new Date()): string {
       (job.lastStatus ? `  lastStatus: ${job.lastStatus}` : "") +
       shellInfo,
     `  ${kind === "shell" ? "command" : "prompt"}: ${payload}`,
+    ...waitingLines(job),
   ].join("\n");
+}
+
+/** Lines under a job waiting for its origin session (see delivery.ts). */
+function waitingLines(job: ScheduledJob): string[] {
+  if (!job.waitingSince) return [];
+  const origin = job.originSessionId ? job.originSessionId.slice(0, 8) : "(unknown)";
+  const lines = [
+    `  waiting for its session ${origin} since ${job.waitingSince} — resume that session, or run_now here to take it over`,
+  ];
+  if (job.pendingWake) {
+    lines.push(
+      job.lastShell?.ok === false
+        ? "  a failed run is held for it"
+        : "  a run's result is held for it",
+    );
+  }
+  return lines;
 }
 
 function truncate(s: string, n: number): string {

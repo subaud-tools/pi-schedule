@@ -1500,6 +1500,31 @@ describe("ScheduleRunner — origin-first delivery ladder", () => {
     await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
 
     expect(h.sent).toHaveLength(1); // explicit user act here → full turn
+    expect(h.store.get(job.id, h.project)!.originSessionId).toBe("A"); // home unchanged
+  });
+
+  it("run_now on a job whose session is gone takes it over: this session becomes its home", async () => {
+    const h = makeHarness({ sessionId: "B" });
+    h.trust.trust(h.project);
+    const job = h.createProject("mine");
+    h.setOrigin(job.id, "A"); // gone
+    h.addPresence("C");
+    h.forceDue(job.id);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBe(T0);
+
+    await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
+
+    expect(h.sent).toHaveLength(1);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.originSessionId).toBe("B");
+    expect(after.waitingSince).toBeUndefined();
+
+    // From then on it is delivered here as its home, not left waiting.
+    h.forceDue(job.id, new Date(new Date(T0).getTime() + 3_600_000).toISOString());
+    h.setClock(new Date(new Date(T0).getTime() + 3_600_000));
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+    expect(h.sent).toHaveLength(2);
   });
 });
 
@@ -1592,5 +1617,33 @@ describe("ScheduleRunner — waiting shell jobs run silently and hold their turn
     const after = h.store.get(job.id, h.project)!;
     expect(after.pendingWake).toBeUndefined();
     expect(after.lastShell?.code).toBe(0);
+  });
+
+  it("run_now taking over a waiting shell job delivers its held turn when the new run does not wake", async () => {
+    const o: HarnessOpts = { execResult: { code: 2, stderr: "boom" } };
+    const { h, job } = waitingShell(o);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.pendingWake).toBe(true);
+
+    o.execResult = { code: 0, stdout: "fine\n" }; // passes now; wakeOn=failure
+    await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
+
+    expect(h.execCalls).toHaveLength(2);
+    expect(h.sent).toHaveLength(1); // the held failure turn
+    expect(h.sent[0]?.content).toContain("shellStatus: failure");
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.originSessionId).toBe("B");
+    expect(after.pendingWake).toBeUndefined();
+    expect(after.waitingSince).toBeUndefined();
+  });
+
+  it("run_now taking over a waiting shell job sends one turn when the new run wakes itself", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 2, stderr: "boom" } });
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    await h.runner.fireDue(h.ctx, { source: "run_now", jobIds: [job.id] });
+
+    expect(h.sent).toHaveLength(1); // the new run's turn replaces the held one
+    expect(h.store.get(job.id, h.project)!.pendingWake).toBeUndefined();
   });
 });

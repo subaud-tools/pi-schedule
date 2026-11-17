@@ -443,6 +443,54 @@ describe("schedule tool — list formatting", () => {
   });
 });
 
+describe("schedule tool — list shows waiting jobs", () => {
+  it("adds the waiting line under a job waiting for its session", async () => {
+    const s = setup();
+    s.seed({
+      name: "orphan",
+      originSessionId: "0123456789abcdef",
+      waitingSince: "2025-01-01T00:00:00.000Z",
+    });
+    const out = text(await s.exec({ action: "list" }) as any);
+    expect(out).toContain(
+      "waiting for its session 01234567 since 2025-01-01T00:00:00.000Z — resume that session, or run_now here to take it over",
+    );
+    expect(out).not.toContain("is held for it");
+  });
+
+  it("says a failed run is held when a waiting shell job holds a turn", async () => {
+    const s = setup();
+    s.seed({
+      name: "orphan-shell",
+      action: "shell",
+      command: "false",
+      originSessionId: "0123456789abcdef",
+      waitingSince: "2025-01-01T00:00:00.000Z",
+      pendingWake: true,
+      lastShell: {
+        ok: false,
+        command: "false",
+        cwd: "/",
+        timeoutMs: 1000,
+        code: 1,
+        killed: false,
+        stdout: "",
+        stderr: "",
+      },
+    });
+    const out = text(await s.exec({ action: "list" }) as any);
+    expect(out).toContain("waiting for its session 01234567");
+    expect(out).toContain("a failed run is held for it");
+  });
+
+  it("shows no waiting line for a job that is not waiting", async () => {
+    const s = setup();
+    s.seed({ name: "plain", originSessionId: "0123456789abcdef" });
+    const out = text(await s.exec({ action: "list" }) as any);
+    expect(out).not.toContain("waiting for its session");
+  });
+});
+
 describe("schedule tool — misc branches", () => {
   it("reports an unknown action", async () => {
     const { exec } = setup();
