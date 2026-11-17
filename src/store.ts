@@ -138,6 +138,8 @@ function normalizeJob(raw: ScheduledJob): ScheduledJob {
     missedWindow: raw.missedWindow ?? DEFAULT_MISSED_WINDOW,
     tier: raw.tier ?? DEFAULT_TIER,
     originSessionId,
+    waitingSince: typeof raw.waitingSince === "string" ? raw.waitingSince : undefined,
+    pendingWake: raw.pendingWake === true ? true : undefined,
   };
 }
 
@@ -492,6 +494,10 @@ export class ScheduleStore {
   /**
    * Record a fire/skip attempt: advances nextRunAt from `at` (unless advance=false).
    * runCount increments only for delivered (ok) and error fires — not skip/locked.
+   * Clears waitingSince unless the caller passes it (an attempt is recorded by
+   * a session that may deliver the job, so its wait is over). A run (ok or
+   * error) replaces a held shell turn: pendingWake stays only when the caller
+   * passes it; a skip keeps it.
    */
   markAttempt(
     job: ScheduledJob,
@@ -502,6 +508,8 @@ export class ScheduleStore {
       idempotencyKey?: string;
       advance?: boolean;
       lastShell?: ShellRunResult;
+      waitingSince?: string;
+      pendingWake?: boolean;
     } = {},
   ): ScheduledJob {
     const advance = opts.advance !== false;
@@ -519,6 +527,8 @@ export class ScheduleStore {
       lastError: opts.error,
       lastIdempotencyKey: opts.idempotencyKey ?? job.lastIdempotencyKey,
       updatedAt: at.toISOString(),
+      waitingSince: opts.waitingSince,
+      pendingWake: opts.pendingWake === true ? true : countRun ? undefined : job.pendingWake,
       ...(opts.lastShell ? { lastShell: opts.lastShell } : {}),
     };
     this.upsert(updated);
