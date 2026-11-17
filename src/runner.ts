@@ -25,7 +25,7 @@ import {
   truncateOutput,
 } from "./action.js";
 import { shouldSkipDueOnSessionStart } from "./cli-prompt.js";
-import { type DeliveryRole, decideDelivery } from "./delivery.js";
+import { type DeliveryRole, decideDelivery, electedSession } from "./delivery.js";
 import { RunLedger, buildRun, newRunId } from "./ledger.js";
 import { JobLockManager } from "./lock.js";
 import { SessionPresence } from "./presence.js";
@@ -41,7 +41,6 @@ import { PrivilegeGuard, type SettledFire } from "./privilege.js";
 import {
   buildFirePrompt,
   buildShellFollowUpPrompt,
-  downgradeNotice,
   notifyLabel,
 } from "./prompt.js";
 import { redactSecrets } from "./redact.js";
@@ -294,15 +293,62 @@ export class ScheduleRunner {
   private deliveryRole(ctx: ExtensionContext, job: ScheduledJob): DeliveryRole {
     const selfId = sessionIdOf(ctx) ?? this.selfSessionId;
     if (!selfId) return "turn";
-    const aliveSessionIds =
-      job.scope === "project"
-        ? this.presence.aliveForProject(job.projectPath ?? ctx.cwd ?? this.cwd)
-        : this.presence.aliveForGlobal();
     return decideDelivery({
       selfSessionId: selfId,
       originSessionId: job.originSessionId,
-      aliveSessionIds,
+      aliveSessionIds: this.aliveFor(ctx, job),
     });
+  }
+
+  /** Live session ids sharing this job's scope. */
+  private aliveFor(ctx: ExtensionContext, job: ScheduledJob): string[] {
+    return job.scope === "project"
+      ? this.presence.aliveForProject(job.projectPath ?? ctx.cwd ?? this.cwd)
+      : this.presence.aliveForGlobal();
+  }
+
+  /** Is THIS session the one elected to do a waiting job's bookkeeping? */
+  private electedFor(ctx: ExtensionContext, job: ScheduledJob): boolean {
+    const selfId = sessionIdOf(ctx) ?? this.selfSessionId;
+    if (!selfId) return false;
+    return (
+      electedSession({ selfSessionId: selfId, aliveSessionIds: this.aliveFor(ctx, job) }) ===
+      selfId
+    );
+  }
+
+  /**
+   * Record that a job waits for its origin session: set waitingSince under the
+   * job's lock and append one run-log row, only the first time per wait. The
+   * job itself stays due and untouched otherwise.
+   */
+  private recordWaiting(job: ScheduledJob, at: Date, source: FireSource): void {
+    if (job.waitingSince) return;
+    const handle = this.locks.tryAcquire(job.id);
+    if (!handle) return;
+    try {
+      const fresh = this.opts.store.get(job.id, this.cwd) ?? job;
+      if (fresh.waitingSince) return;
+      this.opts.store.upsert({ ...fresh, waitingSince: at.toISOString() });
+      this.recordBestEffort({
+        runId: newRunId(),
+        jobId: fresh.id,
+        jobName: fresh.name,
+        scope: fresh.scope,
+        projectPath: fresh.projectPath,
+        idempotencyKey: idempotencyKeyFor(fresh),
+        source,
+        status: "skipped",
+        startedAt: at.toISOString(),
+        endedAt: this.now().toISOString(),
+        detail: "waiting (origin absent)",
+        tier: fresh.tier ?? DEFAULT_TIER,
+        missedWindow: fresh.missedWindow ?? DEFAULT_MISSED_WINDOW,
+        action: fresh.action ?? DEFAULT_JOB_ACTION,
+      });
+    } finally {
+      handle.release();
+    }
   }
 
   private async runWave(
@@ -524,25 +570,6 @@ export class ScheduleRunner {
   ): Promise<{ detail?: string; wokeAgent: boolean; lastShell?: ShellRunResult }> {
     const action: JobAction = job.action ?? DEFAULT_JOB_ACTION;
 
-    // Elected-owner downgrade: the origin session is gone and several sessions
-    // are open. Agent-turn kinds are demoted to a notify so no surprise turn
-    // lands here; display-only kinds (notify/message) are unaffected.
-    if (opts.role === "notify" && action === "prompt") {
-      const msg = downgradeNotice(job);
-      if (ctx.hasUI) ctx.ui.notify(msg, "info");
-      else console.log(msg);
-      this.opts.pi.sendMessage?.(
-        {
-          customType: "pi-schedule",
-          content: msg,
-          display: true,
-          details: { jobId: job.id, action: "notify", runId: opts.runId, downgraded: "prompt" },
-        },
-        { triggerTurn: false },
-      );
-      return { detail: "notify (origin absent; owner)", wokeAgent: false };
-    }
-
     if (action === "notify") {
       const msg = notifyLabel(job);
       if (ctx.hasUI) ctx.ui.notify(msg, "info");
@@ -583,7 +610,7 @@ export class ScheduleRunner {
     if (action === "shell") {
       return this.deliverShell(ctx, job, {
         ...opts,
-        suppressWake: opts.role === "notify",
+        suppressWake: opts.role === "wait",
       });
     }
 
@@ -606,7 +633,7 @@ export class ScheduleRunner {
       source: FireSource;
       forced: boolean;
       deliverAs?: "followUp" | "steer";
-      /** Elected-owner downgrade: run the command but do not wake the agent. */
+      /** Waiting job (origin gone, several sessions): run the command but do not wake the agent. */
       suppressWake?: boolean;
     },
   ): Promise<{ detail?: string; wokeAgent: boolean; lastShell?: ShellRunResult }> {
@@ -671,12 +698,8 @@ export class ScheduleRunner {
       if (instruction) {
         if (opts.suppressWake) {
           // Origin gone + several sessions open: the command still ran (once,
-          // under the lock), but we notify instead of injecting a turn into an
-          // arbitrary session. The persisted shell result above lets any
-          // session pick it up with run_now.
-          const msg = downgradeNotice(job);
-          if (ctx.hasUI) ctx.ui.notify(msg, "info");
-          else console.log(msg);
+          // under the lock), but no turn is injected into an arbitrary
+          // session. The persisted shell result lets run_now pick it up.
           wakeSuppressed = true;
         } else {
           const body = buildShellFollowUpPrompt({
@@ -723,14 +746,25 @@ export class ScheduleRunner {
 
     // Origin-first delivery ladder. run_now is an explicit act in THIS session
     // and always delivers a full turn here; auto waves route to the origin
-    // session (or an elected owner as a notify) so a due job never barges into
-    // an arbitrary session. A deferring session is a complete no-op for this
+    // session, or make the job wait for it, so a due job never barges into an
+    // arbitrary session. A deferring session is a complete no-op for this
     // job — no lock, no ledger, no schedule advance — leaving all bookkeeping
     // to the eligible session.
     const role: DeliveryRole = opts.forced
       ? "turn"
       : this.deliveryRole(ctx, job);
     if (role === "defer") return null;
+
+    // Waiting job: it stays due and nothing reaches any session. Only the
+    // elected session acts, and for a prompt/notify/message job it only
+    // records the wait (once). A shell job's command still runs there.
+    if (role === "wait") {
+      if (!this.electedFor(ctx, job)) return null;
+      if (action !== "shell") {
+        this.recordWaiting(job, at, opts.source);
+        return null;
+      }
+    }
 
     // Pre-lock idempotency (cheap).
     if (!opts.forced && this.alreadyDelivered(job, key)) {
