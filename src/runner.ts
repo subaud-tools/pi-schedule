@@ -112,6 +112,15 @@ export function resolveShell(): string {
 const FIRE_ON_REASONS = new Set(["startup", "new", "resume"]);
 const ERROR_NOTIFY_COOLDOWN_MS = 5 * 60_000;
 
+/** What one delivery did, for the store/ledger bookkeeping in processOne. */
+interface DeliveryResult {
+  detail?: string;
+  wokeAgent: boolean;
+  lastShell?: ShellRunResult;
+  /** Shell only: the run asked for a turn that was held (job is waiting). */
+  pendingWake?: boolean;
+}
+
 export interface RunnerOptions {
   store: ScheduleStore;
   pi: ExtensionAPI;
@@ -373,7 +382,16 @@ export class ScheduleRunner {
         if (meta.source === "tick" && !ctx.isIdle()) {
           return [];
         }
-        candidates = this.opts.store.dueJobs(ctx.cwd ?? this.cwd, now);
+        const cwd = ctx.cwd ?? this.cwd;
+        candidates = this.opts.store.dueJobs(cwd, now);
+        // Shell jobs holding a turn are not due again yet, but a session that
+        // may deliver them should pick the held turn up on this wave.
+        const dueIds = new Set(candidates.map((j) => j.id));
+        candidates.push(
+          ...this.opts.store
+            .listForCwd(cwd)
+            .filter((j) => j.enabled && j.pendingWake && !dueIds.has(j.id)),
+        );
       }
 
       if (candidates.length === 0) return [];
@@ -567,7 +585,7 @@ export class ScheduleRunner {
       deliverAs?: "followUp" | "steer";
       role?: DeliveryRole;
     },
-  ): Promise<{ detail?: string; wokeAgent: boolean; lastShell?: ShellRunResult }> {
+  ): Promise<DeliveryResult> {
     const action: JobAction = job.action ?? DEFAULT_JOB_ACTION;
 
     if (action === "notify") {
@@ -610,7 +628,7 @@ export class ScheduleRunner {
     if (action === "shell") {
       return this.deliverShell(ctx, job, {
         ...opts,
-        suppressWake: opts.role === "wait",
+        waiting: opts.role === "wait",
       });
     }
 
@@ -633,10 +651,13 @@ export class ScheduleRunner {
       source: FireSource;
       forced: boolean;
       deliverAs?: "followUp" | "steer";
-      /** Waiting job (origin gone, several sessions): run the command but do not wake the agent. */
-      suppressWake?: boolean;
+      /**
+       * Waiting job (origin gone, several sessions): run the command but show
+       * nothing in this session and hold any agent turn (pendingWake).
+       */
+      waiting?: boolean;
     },
-  ): Promise<{ detail?: string; wokeAgent: boolean; lastShell?: ShellRunResult }> {
+  ): Promise<DeliveryResult> {
     const command = job.command?.trim();
     if (!command) {
       throw new Error(`shell job "${job.name}" has no command`);
@@ -648,7 +669,7 @@ export class ScheduleRunner {
     const cwd = job.projectPath ?? ctx.cwd ?? this.cwd;
     const timeoutMs = job.timeoutMs ?? DEFAULT_SHELL_TIMEOUT_MS;
 
-    if (ctx.hasUI) {
+    if (ctx.hasUI && !opts.waiting) {
       ctx.ui.notify(
         `[pi-schedule] running shell "${job.name}": ${command}`,
         "info",
@@ -681,7 +702,7 @@ export class ScheduleRunner {
       stderr: redactSecrets(lastShell.stderr),
     };
 
-    this.opts.pi.sendMessage?.(
+    if (!opts.waiting) this.opts.pi.sendMessage?.(
       {
         customType: "pi-schedule",
         content: `Shell "${job.name}" exit ${lastShell.code}${lastShell.killed ? " (killed)" : ""}: ${command}`,
@@ -692,15 +713,16 @@ export class ScheduleRunner {
     );
 
     let wokeAgent = false;
-    let wakeSuppressed = false;
+    let wakeHeld = false;
     if (shouldWakeForShell(job, lastShell)) {
       const instruction = selectShellFollowUp(job, lastShell);
       if (instruction) {
-        if (opts.suppressWake) {
+        if (opts.waiting) {
           // Origin gone + several sessions open: the command still ran (once,
           // under the lock), but no turn is injected into an arbitrary
-          // session. The persisted shell result lets run_now pick it up.
-          wakeSuppressed = true;
+          // session. The turn is held on the job (pendingWake) and delivered
+          // from the stored lastShell by the first session that may.
+          wakeHeld = true;
         } else {
           const body = buildShellFollowUpPrompt({
             job,
@@ -719,8 +741,103 @@ export class ScheduleRunner {
     // Persisted copy: redact credential-shaped output before it lands in
     // schedules.json (outlives the session; readable by any agent/user with
     // home access). Command stays verbatim — it must re-run.
-    const detail = `shell exit=${lastShell.code}${lastShell.killed ? " killed" : ""}${wokeAgent ? " woke" : ""}${wakeSuppressed ? " woke-suppressed" : ""}`;
-    return { detail, wokeAgent, lastShell: persistedShell };
+    const detail = `shell exit=${lastShell.code}${lastShell.killed ? " killed" : ""}${wokeAgent ? " woke" : ""}${wakeHeld ? " woke-held" : ""}`;
+    return { detail, wokeAgent, lastShell: persistedShell, pendingWake: wakeHeld };
+  }
+
+  /**
+   * Deliver a shell job's held turn (pendingWake) from its stored lastShell,
+   * in a session whose role for the job is "turn". Clears pendingWake and
+   * waitingSince under the job's lock; does not run the command or advance
+   * the schedule.
+   */
+  private async deliverHeldTurn(
+    ctx: ExtensionContext,
+    job: ScheduledJob,
+    opts: { source: FireSource; forced: boolean; deliverAs?: "followUp" | "steer" },
+  ): Promise<ScheduledJob | null> {
+    const handle = this.locks.tryAcquire(job.id);
+    if (!handle) return null;
+    try {
+      const fresh = this.opts.store.get(job.id, this.cwd) ?? job;
+      if (!fresh.pendingWake) return null;
+      const at = this.now();
+      const runId = newRunId();
+      // Its own key: a held turn must never mark the job's next slot delivered.
+      const key = `${fresh.id}:held:${runId}`;
+      const tier = fresh.tier ?? DEFAULT_TIER;
+      const missedWindow = fresh.missedWindow ?? DEFAULT_MISSED_WINDOW;
+      const action: JobAction = fresh.action ?? DEFAULT_JOB_ACTION;
+      const cleared: ScheduledJob = {
+        ...fresh,
+        pendingWake: undefined,
+        waitingSince: undefined,
+        updatedAt: at.toISOString(),
+      };
+      const row = {
+        runId,
+        jobId: fresh.id,
+        jobName: fresh.name,
+        scope: fresh.scope,
+        projectPath: fresh.projectPath,
+        idempotencyKey: key,
+        source: opts.source,
+        startedAt: at.toISOString(),
+        tier,
+        missedWindow,
+        action,
+      };
+      const instruction = fresh.lastShell
+        ? selectShellFollowUp(fresh, fresh.lastShell)
+        : undefined;
+      if (!fresh.lastShell || !instruction) {
+        this.opts.store.upsert(cleared);
+        return cleared;
+      }
+      try {
+        const body = buildShellFollowUpPrompt({
+          job: fresh,
+          runId,
+          source: opts.source,
+          forced: opts.forced,
+          result: fresh.lastShell,
+          instruction,
+        });
+        await this.sendAgentMessage(body, ctx, opts.deliverAs);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.opts.store.upsert(cleared);
+        this.recordBestEffort({
+          ...row,
+          status: "error",
+          endedAt: this.now().toISOString(),
+          detail: `held shell turn: ${message}`,
+        });
+        return cleared;
+      }
+      this.privilege.register(runId, tier, {
+        jobId: fresh.id,
+        jobName: fresh.name,
+        scope: fresh.scope,
+        projectPath: fresh.projectPath,
+        idempotencyKey: key,
+        source: opts.source,
+        tier,
+        missedWindow,
+        action,
+        firedAt: this.now().toISOString(),
+      });
+      this.opts.store.upsert(cleared);
+      this.recordBestEffort({
+        ...row,
+        status: "delivered",
+        endedAt: this.now().toISOString(),
+        detail: "held shell turn",
+      });
+      return cleared;
+    } finally {
+      handle.release();
+    }
   }
 
   private async processOne(
@@ -755,15 +872,26 @@ export class ScheduleRunner {
       : this.deliveryRole(ctx, job);
     if (role === "defer") return null;
 
+    // A shell job holding a turn is a candidate before it is due again: only
+    // a session that may deliver it does, and only the held turn.
+    if (!opts.forced && new Date(job.nextRunAt).getTime() > at.getTime()) {
+      if (role === "turn" && job.pendingWake && opts.allowFire) {
+        return this.deliverHeldTurn(ctx, job, opts);
+      }
+      return null;
+    }
+
     // Waiting job: it stays due and nothing reaches any session. Only the
     // elected session acts, and for a prompt/notify/message job it only
-    // records the wait (once). A shell job's command still runs there.
+    // records the wait (once). A shell job's command still runs there,
+    // silently, keeping waitingSince across its attempts.
+    let waitingSince: string | undefined;
     if (role === "wait") {
       if (!this.electedFor(ctx, job)) return null;
-      if (action !== "shell") {
-        this.recordWaiting(job, at, opts.source);
-        return null;
-      }
+      this.recordWaiting(job, at, opts.source);
+      if (action !== "shell") return null;
+      job = this.opts.store.get(job.id, this.cwd) ?? job;
+      waitingSince = job.waitingSince ?? startedAt;
     }
 
     // Pre-lock idempotency (cheap).
@@ -771,6 +899,7 @@ export class ScheduleRunner {
       const advanced = this.opts.store.markAttempt(job, at, "skipped", {
         error: "idempotent_replay",
         idempotencyKey: key,
+        waitingSince,
       });
       this.recordBestEffort({
         runId,
@@ -797,6 +926,7 @@ export class ScheduleRunner {
         const advanced = this.opts.store.markAttempt(job, at, "skipped", {
           error: decision.reason,
           idempotencyKey: key,
+          waitingSince,
         });
         this.recordBestEffort({
           runId,
@@ -838,6 +968,7 @@ export class ScheduleRunner {
         const advanced = this.opts.store.markAttempt(fresh, at, "skipped", {
           error: "idempotent_replay_post_lock",
           idempotencyKey: freshKey,
+          waitingSince,
         });
         this.recordBestEffort({
           runId,
@@ -889,6 +1020,8 @@ export class ScheduleRunner {
       const updated = this.opts.store.markAttempt(fresh, at, "ok", {
         idempotencyKey: opts.forced ? key : freshKey,
         lastShell: delivery.lastShell,
+        pendingWake: delivery.pendingWake,
+        waitingSince,
       });
       const term = terminalReason(updated, updated.runCount);
       const finalJob = term
@@ -914,7 +1047,9 @@ export class ScheduleRunner {
       return finalJob;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (ctx.hasUI) {
+      if (role === "wait") {
+        // A waiting job shows nothing in this session; the run log has it.
+      } else if (ctx.hasUI) {
         ctx.ui.notify(
           `[pi-schedule] failed to fire "${job.name}": ${message}`,
           "error",
@@ -932,6 +1067,7 @@ export class ScheduleRunner {
       const updated = this.opts.store.markAttempt(errorSubject, at, "error", {
         error: message,
         idempotencyKey: errorKey,
+        waitingSince,
       });
       const term = terminalReason(updated, updated.runCount);
       const finalJob = term

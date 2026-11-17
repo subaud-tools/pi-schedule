@@ -1502,3 +1502,95 @@ describe("ScheduleRunner — origin-first delivery ladder", () => {
     expect(h.sent).toHaveLength(1); // explicit user act here → full turn
   });
 });
+
+describe("ScheduleRunner — waiting shell jobs run silently and hold their turn", () => {
+  /** Session "B" is elected; origin "A" is gone; "C" is another open session. */
+  function waitingShell(opts: HarnessOpts, wakeOn: "failure" | "never" = "failure") {
+    // Same object, so a test can change execResult between runs.
+    const h = makeHarness(Object.assign(opts, { sessionId: "B" }));
+    h.trust.trust(h.project);
+    const job = h.store.create({
+      name: "upstream-check",
+      prompt: "Inspect the upstream failure.",
+      action: "shell",
+      command: "check-upstream",
+      wakeOn,
+      tier: "mutate",
+      schedule: parseSchedule("every 1h"),
+      scope: "project",
+      projectPath: h.project,
+    });
+    h.setOrigin(job.id, "A");
+    h.addPresence("C");
+    h.forceDue(job.id);
+    return { h, job };
+  }
+
+  it("runs the command once, shows nothing in the session, stores lastShell and advances", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 0, stdout: "fine\n" } }, "never");
+
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    expect(h.execCalls).toHaveLength(1);
+    expect(h.notifies).toHaveLength(0); // no "running shell" line
+    expect(h.customMessages).toHaveLength(0); // no "Shell … exit" message
+    expect(h.sent).toHaveLength(0);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.lastShell?.code).toBe(0);
+    expect(new Date(after.nextRunAt).getTime()).toBeGreaterThan(new Date(T0).getTime());
+    expect(after.pendingWake).toBeUndefined();
+  });
+
+  it("a failing run with wakeOn=failure holds the turn instead of sending it", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 2, stderr: "boom" } });
+
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    expect(h.sent).toHaveLength(0);
+    expect(h.notifies).toHaveLength(0);
+    expect(h.customMessages).toHaveLength(0);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.pendingWake).toBe(true);
+    expect(after.waitingSince).toBe(T0); // list shows it waiting
+  });
+
+  it("the origin session's next tick delivers the held turn once and clears it", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 2, stderr: "boom" } });
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+
+    h.setOrigin(job.id, "B"); // its own session is the one evaluating now
+    h.setClock(new Date(new Date(T0).getTime() + 60_000)); // not due again yet
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    expect(h.execCalls).toHaveLength(1); // command not re-run
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.content).toContain("shellStatus: failure");
+    expect(h.sent[0]?.content).toContain("Inspect the upstream failure");
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.pendingWake).toBeUndefined();
+    expect(after.waitingSince).toBeUndefined();
+    expect(
+      h.ledger.history({}).some((r) => r.status === "delivered" && r.detail === "held shell turn"),
+    ).toBe(true);
+  });
+
+  it("a successful later run replaces a held turn", async () => {
+    const o: HarnessOpts = { execResult: { code: 2, stderr: "boom" } };
+    const { h, job } = waitingShell(o);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.pendingWake).toBe(true);
+
+    o.execResult = { code: 0, stdout: "fine\n" };
+    const later = new Date(new Date(T0).getTime() + 3_600_000);
+    h.setClock(later);
+    h.forceDue(job.id, later.toISOString());
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    expect(h.execCalls).toHaveLength(2);
+    expect(h.sent).toHaveLength(0);
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.pendingWake).toBeUndefined();
+    expect(after.lastShell?.code).toBe(0);
+  });
+});

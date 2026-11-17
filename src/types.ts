@@ -157,6 +157,12 @@ export interface ScheduledJob {
    * session; cleared when a delivering session records an attempt.
    */
   waitingSince?: string;
+  /**
+   * Shell only: a run's result asked for an agent turn while the job was
+   * waiting; the turn is held until a session that may deliver the job
+   * delivers it from `lastShell`. A later run replaces it.
+   */
+  pendingWake?: boolean;
   enabled: boolean;
   /** Overdue handling. Default catch_up_one. */
   missedWindow: MissedWindowPolicy;
