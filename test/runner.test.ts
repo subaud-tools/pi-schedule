@@ -1566,6 +1566,34 @@ describe("ScheduleRunner — waiting shell jobs run silently and hold their turn
     expect(after.pendingWake).toBeUndefined();
   });
 
+  it("resuming its session clears the waiting marker even when nothing is held or due", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 0, stdout: "fine\n" } }, "never");
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBe(T0);
+
+    h.setOrigin(job.id, "B"); // its own session is back and evaluating
+    h.setClock(new Date(new Date(T0).getTime() + 60_000)); // not due again yet
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    const after = h.store.get(job.id, h.project)!;
+    expect(after.waitingSince).toBeUndefined(); // list no longer says waiting
+    expect(h.execCalls).toHaveLength(1); // command not re-run
+    expect(h.sent).toHaveLength(0);
+  });
+
+  it("never sets the waiting marker without its run-log row when the lock is briefly taken", async () => {
+    const { h, job } = waitingShell({ execResult: { code: 0, stdout: "fine\n" } }, "never");
+    // recordWaiting's lock attempt loses to another holder; later attempts succeed.
+    const spy = vi.spyOn(JobLockManager.prototype, "tryAcquire").mockImplementationOnce(() => null);
+    await h.runner.fireDue(h.ctx, { source: "session_start" });
+    spy.mockRestore();
+    await h.runner.fireDue(h.ctx, { source: "tick" });
+
+    const rows = h.ledger.history({}).filter((r) => r.detail === "waiting (origin absent)");
+    expect(rows).toHaveLength(1);
+    expect(h.store.get(job.id, h.project)!.waitingSince).toBeDefined();
+  });
+
   it("a failing run with wakeOn=failure holds the turn instead of sending it", async () => {
     const { h, job } = waitingShell({ execResult: { code: 2, stderr: "boom" } });
 

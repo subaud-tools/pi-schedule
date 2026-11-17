@@ -329,16 +329,18 @@ export class ScheduleRunner {
   /**
    * Record that a job waits for its origin session: set waitingSince under the
    * job's lock and append one run-log row, only the first time per wait. The
-   * job itself stays due and untouched otherwise.
+   * job itself stays due and untouched otherwise. Returns the job with its
+   * marker, or null when the lock was taken and nothing was recorded.
    */
-  private recordWaiting(job: ScheduledJob, at: Date, source: FireSource): void {
-    if (job.waitingSince) return;
+  private recordWaiting(job: ScheduledJob, at: Date, source: FireSource): ScheduledJob | null {
+    if (job.waitingSince) return job;
     const handle = this.locks.tryAcquire(job.id);
-    if (!handle) return;
+    if (!handle) return null;
     try {
       const fresh = this.opts.store.get(job.id, this.cwd) ?? job;
-      if (fresh.waitingSince) return;
-      this.opts.store.upsert({ ...fresh, waitingSince: at.toISOString() });
+      if (fresh.waitingSince) return fresh;
+      const marked: ScheduledJob = { ...fresh, waitingSince: at.toISOString() };
+      this.opts.store.upsert(marked);
       this.recordBestEffort({
         runId: newRunId(),
         jobId: fresh.id,
@@ -355,6 +357,29 @@ export class ScheduleRunner {
         missedWindow: fresh.missedWindow ?? DEFAULT_MISSED_WINDOW,
         action: fresh.action ?? DEFAULT_JOB_ACTION,
       });
+      return marked;
+    } finally {
+      handle.release();
+    }
+  }
+
+  /**
+   * End a wait whose job is not due: its own session (or a lone session) is
+   * back, so clear waitingSince under the job's lock.
+   */
+  private endWaiting(job: ScheduledJob): ScheduledJob | null {
+    const handle = this.locks.tryAcquire(job.id);
+    if (!handle) return null;
+    try {
+      const fresh = this.opts.store.get(job.id, this.cwd) ?? job;
+      if (!fresh.waitingSince || fresh.pendingWake) return null;
+      const cleared: ScheduledJob = {
+        ...fresh,
+        waitingSince: undefined,
+        updatedAt: this.now().toISOString(),
+      };
+      this.opts.store.upsert(cleared);
+      return cleared;
     } finally {
       handle.release();
     }
@@ -384,13 +409,16 @@ export class ScheduleRunner {
         }
         const cwd = ctx.cwd ?? this.cwd;
         candidates = this.opts.store.dueJobs(cwd, now);
-        // Shell jobs holding a turn are not due again yet, but a session that
-        // may deliver them should pick the held turn up on this wave.
+        // Shell jobs holding a turn, or still marked waiting, are not due
+        // again yet, but a session that may deliver them should pick the held
+        // turn up (or end the wait) on this wave.
         const dueIds = new Set(candidates.map((j) => j.id));
         candidates.push(
           ...this.opts.store
             .listForCwd(cwd)
-            .filter((j) => j.enabled && j.pendingWake && !dueIds.has(j.id)),
+            .filter(
+              (j) => j.enabled && (j.pendingWake || j.waitingSince) && !dueIds.has(j.id),
+            ),
         );
       }
 
@@ -903,11 +931,15 @@ export class ScheduleRunner {
       : this.deliveryRole(ctx, job);
     if (role === "defer") return null;
 
-    // A shell job holding a turn is a candidate before it is due again: only
-    // a session that may deliver it does, and only the held turn.
+    // A shell job holding a turn, or still marked waiting, is a candidate
+    // before it is due again: only a session that may deliver it acts, by
+    // delivering the held turn or ending the wait.
     if (!opts.forced && new Date(job.nextRunAt).getTime() > at.getTime()) {
       if (role === "turn" && job.pendingWake && opts.allowFire) {
         return this.deliverHeldTurn(ctx, job, opts);
+      }
+      if (role === "turn" && job.waitingSince) {
+        return this.endWaiting(job);
       }
       return null;
     }
@@ -919,10 +951,13 @@ export class ScheduleRunner {
     let waitingSince: string | undefined;
     if (role === "wait") {
       if (!this.electedFor(ctx, job)) return null;
-      this.recordWaiting(job, at, opts.source);
+      const marked = this.recordWaiting(job, at, opts.source);
       if (action !== "shell") return null;
-      job = this.opts.store.get(job.id, this.cwd) ?? job;
-      waitingSince = job.waitingSince ?? startedAt;
+      // No marker means recordWaiting lost its lock this tick: stay due and
+      // let the next tick record the wait with its row before running.
+      if (!marked) return null;
+      job = marked;
+      waitingSince = marked.waitingSince;
     }
 
     // Pre-lock idempotency (cheap).
